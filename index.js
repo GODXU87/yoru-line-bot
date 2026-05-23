@@ -6,7 +6,6 @@ app.use(express.json());
 
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const FINMIND_TOKEN = process.env.FINMIND_TOKEN;
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY
@@ -29,7 +28,7 @@ app.post("/webhook", async (req, res) => {
         if (userText === "台股") {
           replyText = await createTaiwanStockAnalysis();
         } else if (userText === "資金" || userText === "資金排行") {
-          replyText = await createRealSectorMoneyFlowReport();
+          replyText = await createSectorMoneyFlowAnalysis();
         } else if (userText === "20MA" || userText === "均線") {
           replyText = await createMA20StrategyNote();
         } else if (userText === "美股") {
@@ -56,343 +55,14 @@ function createHelpMessage() {
     "【YORU LAB 投資機器人】\n\n" +
     "你可以輸入：\n\n" +
     "台股｜台股盤勢觀察\n" +
-    "資金｜族群成交金額排行＋20MA 篩選＋法人買超\n" +
-    "資金排行｜同上\n" +
+    "資金｜族群資金觀察\n" +
+    "資金排行｜族群資金觀察\n" +
     "20MA｜20 日均線觀察邏輯\n" +
     "美股｜美股觀察\n" +
     "BTC｜加密貨幣觀察\n\n" +
-    "提醒：目前資料源以 FinMind 為主，盤後資料可能有更新時間差。內容僅供研究紀錄與市場觀察，不構成投資建議。"
+    "目前版本尚未接入可用的全市場即時行情資料，因此不會提供即時報價、即時漲跌幅、法人買賣超或真實個股篩選名單。\n\n" +
+    "內容僅供研究紀錄與市場觀察，不構成投資建議。"
   );
-}
-
-async function createRealSectorMoneyFlowReport() {
-  try {
-    if (!FINMIND_TOKEN) {
-      return (
-        "【YORU LAB 資金排行】\n\n" +
-        "目前尚未設定 FINMIND_TOKEN，所以無法抓取台股成交金額、20MA 與三大法人資料。\n\n" +
-        "請到 Render 的 Environment Variables 新增：\n\n" +
-        "FINMIND_TOKEN = 你的 FinMind API Token\n\n" +
-        "設定後重新部署，再輸入「資金排行」。"
-      );
-    }
-
-    const today = new Date();
-    const endDate = formatDate(today);
-    const startDate = formatDate(addDays(today, -60));
-
-    const stockInfo = await fetchFinMind("TaiwanStockInfo", {});
-    const priceData = await fetchFinMind("TaiwanStockPrice", {
-      start_date: startDate,
-      end_date: endDate
-    });
-
-    if (!Array.isArray(priceData) || priceData.length === 0) {
-      return (
-        "【YORU LAB 資金排行】\n\n" +
-        "目前沒有抓到股價資料，可能原因：\n" +
-        "1. FinMind API 暫時無資料\n" +
-        "2. Token 權限或額度不足\n" +
-        "3. 今日資料尚未更新\n\n" +
-        "請稍後再試，或檢查 Render Logs。"
-      );
-    }
-
-    const infoMap = buildStockInfoMap(stockInfo);
-    const latestDate = getLatestDate(priceData);
-    const latestPrices = priceData.filter((row) => row.date === latestDate);
-
-    const commonStocks = latestPrices.filter((row) => {
-      const id = String(row.stock_id || "");
-      return /^\d{4}$/.test(id) && infoMap[id] && infoMap[id].industry_category;
-    });
-
-    const sectorRank = buildSectorRank(commonStocks, infoMap).slice(0, 6);
-
-    const ma20Map = buildMA20Map(priceData);
-    const belowMA20BySector = buildBelowMA20BySector(
-      sectorRank,
-      commonStocks,
-      infoMap,
-      ma20Map
-    );
-
-    const institutionalReport = await createInstitutionalBuyReport(latestDate, infoMap);
-
-    let reply =
-      "【YORU LAB 資金排行｜盤後資料版】\n" +
-      `資料日期：${latestDate}\n\n` +
-      "一、目前成交金額集中族群排行\n";
-
-    sectorRank.forEach((sector, index) => {
-      reply +=
-        `${index + 1}. ${sector.industry}｜成交金額約 ${formatMoneyTW(
-          sector.totalTradingMoney
-        )}｜檔數 ${sector.count}\n`;
-    });
-
-    reply += "\n二、各族群中低於 20MA 的股票\n";
-
-    sectorRank.forEach((sector) => {
-      const list = belowMA20BySector[sector.industry] || [];
-
-      reply += `\n【${sector.industry}】\n`;
-
-      if (list.length === 0) {
-        reply += "目前沒有篩到明顯低於 20MA 的股票，或資料不足。\n";
-      } else {
-        list.slice(0, 5).forEach((stock) => {
-          reply +=
-            `${stock.stock_id} ${stock.stock_name}｜收盤 ${stock.close}｜20MA ${stock.ma20}｜差距 ${stock.diffPct}%\n`;
-        });
-      }
-    });
-
-    reply += "\n三、三大法人昨日買超觀察\n";
-    reply += institutionalReport;
-
-    reply +=
-      "\n\nYORU LAB 筆記：\n" +
-      "成交金額集中代表市場注意力，不等於一定會上漲。\n" +
-      "低於 20MA 也不代表便宜，可能是弱勢延續。\n" +
-      "比較值得觀察的是：族群有量、個股回檔不破結構、法人或資金開始重新承接。\n\n" +
-      "內容僅供研究紀錄與市場觀察，不構成任何投資建議、買賣指令或獲利保證。";
-
-    return reply.slice(0, 4900);
-  } catch (error) {
-    console.error("createRealSectorMoneyFlowReport error:", error);
-
-    return (
-      "【YORU LAB 資金排行】\n\n" +
-      "資料抓取或計算時發生錯誤。\n\n" +
-      "可能原因：\n" +
-      "1. FinMind Token 沒設定或權限不足\n" +
-      "2. API 回傳資料過大，Render 免費版處理較慢\n" +
-      "3. 三大法人全市場資料可能需要較高權限\n" +
-      "4. 今日盤後資料尚未更新\n\n" +
-      "請到 Render Logs 看錯誤訊息。"
-    );
-  }
-}
-
-async function createInstitutionalBuyReport(latestDate, infoMap) {
-  try {
-    const institutionalData = await fetchFinMind("TaiwanStockInstitutionalInvestorsBuySell", {
-      start_date: latestDate
-    });
-
-    if (!Array.isArray(institutionalData) || institutionalData.length === 0) {
-      return (
-        "目前沒有抓到三大法人買賣超資料，可能是資料尚未更新、Token 權限不足，或此資料集無法一次抓取全市場。\n"
-      );
-    }
-
-    const grouped = {};
-
-    for (const row of institutionalData) {
-      const stockId = String(row.stock_id || "");
-      if (!/^\d{4}$/.test(stockId)) continue;
-
-      const buy = Number(row.buy || 0);
-      const sell = Number(row.sell || 0);
-      const net = buy - sell;
-
-      if (!grouped[stockId]) {
-        grouped[stockId] = 0;
-      }
-
-      grouped[stockId] += net;
-    }
-
-    const ranking = Object.entries(grouped)
-      .map(([stock_id, netBuy]) => ({
-        stock_id,
-        stock_name: infoMap[stock_id]?.stock_name || "",
-        industry: infoMap[stock_id]?.industry_category || "",
-        netBuy
-      }))
-      .filter((item) => item.netBuy > 0)
-      .sort((a, b) => b.netBuy - a.netBuy)
-      .slice(0, 10);
-
-    if (ranking.length === 0) {
-      return "目前沒有篩到三大法人合計買超為正的股票，或資料不足。\n";
-    }
-
-    let text = "三大法人合計買超前 10 名：\n";
-
-    ranking.forEach((item, index) => {
-      text +=
-        `${index + 1}. ${item.stock_id} ${item.stock_name}｜${item.industry}｜買超 ${formatShares(item.netBuy)}\n`;
-    });
-
-    return text;
-  } catch (error) {
-    console.error("createInstitutionalBuyReport error:", error);
-
-    return (
-      "三大法人資料抓取失敗。可能是 FinMind 權限限制，或全市場三大法人資料需要更高方案。\n"
-    );
-  }
-}
-
-function buildStockInfoMap(stockInfo) {
-  const map = {};
-
-  if (!Array.isArray(stockInfo)) return map;
-
-  for (const item of stockInfo) {
-    const stockId = String(item.stock_id || "");
-    if (!stockId) continue;
-
-    map[stockId] = {
-      stock_id: stockId,
-      stock_name: item.stock_name || item.name || "",
-      industry_category: item.industry_category || "",
-      type: item.type || "",
-      market: item.market || ""
-    };
-  }
-
-  return map;
-}
-
-function buildSectorRank(latestPrices, infoMap) {
-  const sectorMap = {};
-
-  for (const row of latestPrices) {
-    const stockId = String(row.stock_id || "");
-    const info = infoMap[stockId];
-
-    if (!info || !info.industry_category) continue;
-
-    const industry = info.industry_category;
-    const tradingMoney = Number(row.Trading_money || 0);
-
-    if (!sectorMap[industry]) {
-      sectorMap[industry] = {
-        industry,
-        totalTradingMoney: 0,
-        count: 0
-      };
-    }
-
-    sectorMap[industry].totalTradingMoney += tradingMoney;
-    sectorMap[industry].count += 1;
-  }
-
-  return Object.values(sectorMap)
-    .filter((item) => item.totalTradingMoney > 0)
-    .sort((a, b) => b.totalTradingMoney - a.totalTradingMoney);
-}
-
-function buildMA20Map(priceData) {
-  const grouped = {};
-
-  for (const row of priceData) {
-    const stockId = String(row.stock_id || "");
-    if (!/^\d{4}$/.test(stockId)) continue;
-
-    if (!grouped[stockId]) {
-      grouped[stockId] = [];
-    }
-
-    grouped[stockId].push({
-      date: row.date,
-      close: Number(row.close || 0)
-    });
-  }
-
-  const ma20Map = {};
-
-  for (const stockId of Object.keys(grouped)) {
-    const rows = grouped[stockId]
-      .filter((item) => item.close > 0)
-      .sort((a, b) => a.date.localeCompare(b.date));
-
-    if (rows.length < 20) continue;
-
-    const latest = rows[rows.length - 1];
-    const last20 = rows.slice(-20);
-    const ma20 =
-      last20.reduce((sum, item) => sum + item.close, 0) / last20.length;
-
-    ma20Map[stockId] = {
-      close: round(latest.close, 2),
-      ma20: round(ma20, 2),
-      diffPct: round(((latest.close - ma20) / ma20) * 100, 2)
-    };
-  }
-
-  return ma20Map;
-}
-
-function buildBelowMA20BySector(sectorRank, latestPrices, infoMap, ma20Map) {
-  const targetIndustries = sectorRank.map((item) => item.industry);
-  const result = {};
-
-  for (const industry of targetIndustries) {
-    result[industry] = [];
-  }
-
-  for (const row of latestPrices) {
-    const stockId = String(row.stock_id || "");
-    const info = infoMap[stockId];
-    const ma = ma20Map[stockId];
-
-    if (!info || !ma) continue;
-    if (!targetIndustries.includes(info.industry_category)) continue;
-
-    if (ma.close < ma.ma20) {
-      result[info.industry_category].push({
-        stock_id: stockId,
-        stock_name: info.stock_name,
-        close: ma.close,
-        ma20: ma.ma20,
-        diffPct: ma.diffPct,
-        tradingMoney: Number(row.Trading_money || 0)
-      });
-    }
-  }
-
-  for (const industry of Object.keys(result)) {
-    result[industry].sort((a, b) => b.tradingMoney - a.tradingMoney);
-  }
-
-  return result;
-}
-
-async function fetchFinMind(dataset, params = {}) {
-  const url = new URL("https://api.finmindtrade.com/api/v4/data");
-
-  url.searchParams.set("dataset", dataset);
-
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, value);
-    }
-  }
-
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${FINMIND_TOKEN}`
-    }
-  });
-
-  const json = await response.json();
-
-  if (!response.ok) {
-    console.error("FinMind HTTP error:", json);
-    throw new Error("FinMind HTTP error");
-  }
-
-  if (json.status && json.status !== 200) {
-    console.error("FinMind API error:", json);
-    throw new Error(json.msg || "FinMind API error");
-  }
-
-  return json.data || [];
 }
 
 async function createTaiwanStockAnalysis() {
@@ -402,7 +72,7 @@ async function createTaiwanStockAnalysis() {
 請產生一則 LINE 用的「台股盤勢觀察」。
 
 重要前提：
-目前這個指令不抓即時行情資料，因此你不能捏造：
+目前這個指令沒有接入即時行情 API，因此你不能捏造：
 加權指數點位、成交量、外資買賣超、個股價格、即時漲跌幅、今日實際資金流向、實際強勢族群。
 
 請用繁體中文輸出。
@@ -415,10 +85,34 @@ async function createTaiwanStockAnalysis() {
 【YORU LAB 台股觀察｜AI 測試版】
 
 一、盤勢重點
+用 2～3 句說明今日觀察台股時，應注意哪些市場結構。
+可以提到：
+大盤方向、櫃買指數、權值股、電子股、金融股、題材股輪動。
+但不能假裝知道即時數據。
+
 二、技術面觀察
+用實戰語氣說明可以觀察：
+5MA、10MA、20MA、量價、K 線結構、支撐壓力、趨勢是否延續。
+不要寫得太教科書。
+
 三、資金族群觀察
+說明若要判斷資金在哪些族群，應觀察：
+成交值是否放大、族群是否連續轉強、強勢股是否擴散、櫃買是否同步。
+可以提到常見觀察族群：
+AI、半導體、散熱、PCB、重電、軍工、機器人、金融、航運、觀光、生技。
+但要說明這只是觀察框架，不代表今日實際資金流入。
+
 四、20MA 篩選邏輯
+說明：
+如果某族群有資金關注，可以進一步找族群內「股價仍低於 20MA」的股票。
+但低於 20MA 不代表便宜，可能只是弱勢。
+比較值得觀察的是：
+族群強、個股回檔、量縮止跌、跌幅收斂、接近支撐、準備站回短均。
+應避開：
+跌破 20MA 後持續破底、反彈無量、族群也轉弱的股票。
+
 五、YORU LAB 筆記
+用 3 句話總結，語氣要像個人投資筆記，有觀點但不能變成買賣建議。
 
 限制：
 - 不提供買進或賣出建議
@@ -426,7 +120,67 @@ async function createTaiwanStockAnalysis() {
 - 不保證漲跌
 - 不捏造即時數據
 - 不列出假的個股名單
+- 不得使用「必漲」、「穩賺」、「一定會噴」、「無腦買」
 - 最後必須加入：
+
+內容僅供研究紀錄與市場觀察，不構成任何投資建議、買賣指令或獲利保證。投資前請自行評估風險。
+`;
+
+  return await askOpenAI(prompt);
+}
+
+async function createSectorMoneyFlowAnalysis() {
+  const prompt = `
+你是「YORU LAB 投資筆記」的台股族群資金分析助理。
+
+請產生一則 LINE 用的「族群資金觀察」。
+
+重要前提：
+目前系統尚未接入可用的全市場即時行情資料、成交值排名、產業分類、日 K、20MA 與三大法人資料。
+因此不能捏造：
+今日資金實際流入哪個族群、成交值排名、法人買賣超、個股價格、漲跌幅、低於 20MA 的真實個股名單。
+
+請用繁體中文輸出。
+語氣要專業、直接、有投資筆記感。
+內容要精簡，適合 LINE 閱讀。
+
+請按照以下格式輸出：
+
+【YORU LAB 族群資金觀察｜AI 測試版】
+
+一、目前限制
+目前版本尚未接入可用的全市場資料源，因此無法直接列出「今日資金集中族群」、「低於 20MA 的真實股票清單」與「三大法人昨日買超名單」。
+
+二、資金在哪裡，要看什麼？
+請用 3～5 點說明判斷族群資金的方法：
+成交值、漲幅擴散、族群連動、指標股強弱、櫃買指數、題材延續性。
+
+三、常見觀察族群
+列出目前台股常見會被觀察的族群：
+AI、半導體、散熱、PCB、重電、軍工、機器人、金融、航運、觀光、生技、綠能。
+要明確說明：
+這是觀察清單，不代表今日實際資金流入。
+
+四、族群內低於 20MA 怎麼看？
+說明：
+先確認族群有資金，再找族群內還沒站上 20MA 的股票。
+但低於 20MA 不是買進理由。
+要區分：
+1. 強勢族群中的健康回檔
+2. 弱勢股票的持續破線
+
+五、如果未來接入資料，應該怎麼排行？
+請說明一個合理的排序邏輯：
+1. 先用成交金額找出市場最熱族群
+2. 再看族群內指標股是否同步轉強
+3. 接著篩出低於 20MA 但尚未破壞大結構的股票
+4. 最後交叉比對三大法人是否有買超
+5. 只把它當觀察清單，不直接當作買進名單
+
+六、YORU LAB 筆記
+用 3 句話總結這套資金觀察邏輯。
+
+最後加入：
 內容僅供研究紀錄與市場觀察，不構成任何投資建議、買賣指令或獲利保證。
 `;
 
@@ -443,15 +197,26 @@ async function createMA20StrategyNote() {
 語氣要像實戰投資筆記，不要太像教科書。
 內容要精簡，適合 LINE 閱讀。
 
-格式：
+請按照以下格式輸出：
 
 【YORU LAB 20MA 觀察筆記】
 
 一、20MA 代表什麼？
+簡單說明 20 日均線通常代表短中期趨勢與市場成本區。
+
 二、低於 20MA 不等於便宜
+說明股價低於 20MA 可能代表短線偏弱，不能單純因為跌到均線下就低接。
+
 三、比較好的觀察方式
+列出 4 個條件：
+族群仍強、股價回檔但不破大結構、量縮止跌、重新站回短均或 20MA。
+
 四、危險訊號
+列出 4 個條件：
+跌破 20MA 後持續破底、反彈無量、跌破前低、族群同步轉弱。
+
 五、YORU LAB 筆記
+用 3 句話總結 20MA 的使用觀念。
 
 最後加入：
 內容僅供研究紀錄與市場觀察，不構成任何投資建議、買賣指令或獲利保證。
@@ -465,7 +230,12 @@ async function createUSStockAnalysis() {
 你是「YORU LAB 投資筆記」的美股市場觀察助理。
 
 請產生一則 LINE 用的「美股觀察」。
-目前沒有接入即時行情 API，因此不能捏造 SPY、QQQ、DIA、VIX、個股價格、即時漲跌幅或最新經濟數據。
+
+重要前提：
+目前沒有接入即時行情 API，因此不能捏造：
+SPY、QQQ、DIA、VIX、個股價格、即時漲跌幅、CPI、FOMC 最新結果或任何即時數據。
+
+請用繁體中文輸出，內容精簡，適合 LINE 閱讀。
 
 格式：
 
@@ -477,6 +247,7 @@ async function createUSStockAnalysis() {
 四、風險提醒
 五、YORU LAB 筆記
 
+請提醒目前沒有即時行情資料，只能提供觀察框架。
 最後加入：
 內容僅供研究紀錄與市場觀察，不構成投資建議。
 `;
@@ -489,7 +260,12 @@ async function createBTCAnalysis() {
 你是「YORU LAB 投資筆記」的加密貨幣市場觀察助理。
 
 請產生一則 LINE 用的「BTC 觀察」。
-目前沒有接入即時行情 API，因此不能捏造 BTC 價格、即時漲跌幅、資金費率、OI、ETF 淨流入、清算數據或鏈上數據。
+
+重要前提：
+目前沒有接入即時行情 API，因此不能捏造：
+BTC 價格、即時漲跌幅、資金費率、OI、ETF 淨流入、清算數據、鏈上數據。
+
+請用繁體中文輸出，內容精簡，適合 LINE 閱讀。
 
 格式：
 
@@ -501,6 +277,7 @@ async function createBTCAnalysis() {
 四、風險提醒
 五、YORU LAB 筆記
 
+請提醒目前沒有即時行情資料，只能提供觀察框架。
 最後加入：
 內容僅供研究紀錄與市場觀察，不構成投資建議。
 `;
@@ -553,60 +330,6 @@ async function replyMessage(replyToken, text) {
     const errorText = await response.text();
     console.error("LINE reply error:", errorText);
   }
-}
-
-function formatDate(date) {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
-}
-
-function getLatestDate(rows) {
-  return rows
-    .map((row) => row.date)
-    .filter(Boolean)
-    .sort()
-    .pop();
-}
-
-function round(value, digits = 2) {
-  const base = Math.pow(10, digits);
-  return Math.round(value * base) / base;
-}
-
-function formatMoneyTW(value) {
-  const number = Number(value || 0);
-
-  if (number >= 100000000) {
-    return `${round(number / 100000000, 2)} 億`;
-  }
-
-  if (number >= 10000) {
-    return `${round(number / 10000, 2)} 萬`;
-  }
-
-  return `${number}`;
-}
-
-function formatShares(value) {
-  const number = Number(value || 0);
-
-  if (number >= 1000000) {
-    return `${round(number / 1000000, 2)} 百萬股`;
-  }
-
-  if (number >= 1000) {
-    return `${round(number / 1000, 2)} 千股`;
-  }
-
-  return `${number} 股`;
 }
 
 const port = process.env.PORT || 3000;
